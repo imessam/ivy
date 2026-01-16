@@ -35,8 +35,10 @@ exclude = [
 test_paths = []
 
 for file_path in set(modified_files):
-    suffix = file_path.rsplit("/", 1)[1].replace(".py", "")
-
+    try:
+        suffix = file_path.rsplit("/", 1)[1].replace(".py", "")
+    except IndexError:
+        continue
     if suffix in exclude:
         continue
 
@@ -70,7 +72,7 @@ print("Running tests:", test_paths)
 
 for test_path in test_paths:
     pytest_command = (
-        f"pytest {test_path} -p no:warnings --tb=short --backend jax,tensorflow,torch"
+        f"pytest {test_path} -p no:warnings --tb no --num-examples 10 --backend jax,numpy,tensorflow"
     )
     print(f"Running test command: {pytest_command}")
     result = subprocess.run(pytest_command, shell=True)

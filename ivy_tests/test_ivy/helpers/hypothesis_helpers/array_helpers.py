@@ -7,7 +7,11 @@ from functools import reduce as _reduce
 from operator import mul
 import sys
 import string
-import ml_dtypes  # noqa
+
+try:
+    import ml_dtypes  # noqa
+except:
+    pass
 
 # local
 import ivy_tests.test_ivy.helpers.globals as test_globals
@@ -1806,6 +1810,7 @@ def arrays_for_pooling(
             num_arrays=1,
             max_value=100,
             min_value=-100,
+            abs_smallest_val=1e-04,
         )
     )
 

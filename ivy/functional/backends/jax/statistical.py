@@ -1,4 +1,5 @@
 # global
+import jax
 import jax.numpy as jnp
 from typing import Union, Optional, Sequence
 
@@ -57,7 +58,7 @@ def mean(
     axis = tuple(axis) if isinstance(axis, list) else axis
     if dtype is not None:
         dtype = ivy.as_native_dtype(dtype)
-        x = x.astype(dtype)
+        x = jnp.astype(x, dtype)
     return jnp.mean(x, axis=axis, keepdims=keepdims, dtype=x.dtype)
 
 
@@ -110,8 +111,13 @@ def sum(
     if dtype is None:
         dtype = x.dtype
     if dtype != x.dtype and not ivy.is_bool_dtype(x):
-        x = x.astype(dtype)
+        x = jnp.astype(x, dtype)
     axis = tuple(axis) if isinstance(axis, list) else axis
+    if ivy.is_bool_dtype(x):
+        if jax.config.jax_enable_x64:
+            dtype = ivy.as_native_dtype("int64")
+        else:
+            dtype = ivy.as_native_dtype("int32")
     return jnp.sum(a=x, axis=axis, dtype=dtype, keepdims=keepdims)
 
 

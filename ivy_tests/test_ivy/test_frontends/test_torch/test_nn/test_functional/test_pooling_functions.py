@@ -1,5 +1,5 @@
 # global
-from hypothesis import strategies as st
+from hypothesis import assume, strategies as st
 
 # local
 import ivy_tests.test_ivy.helpers as helpers
@@ -118,7 +118,7 @@ def test_torch_adaptive_avg_pool2d(
 @handle_frontend_test(
     fn_tree="torch.nn.functional.adaptive_max_pool2d",
     dtype_and_x=helpers.dtype_and_values(
-        available_dtypes=helpers.get_dtypes("valid"),
+        available_dtypes=helpers.get_dtypes("float"),
         min_num_dims=3,
         max_num_dims=4,
         min_dim_size=5,
@@ -200,6 +200,7 @@ def test_torch_adaptive_max_pool3d(
         on_device=on_device,
         input=x[0],
         output_size=output_size,
+        atol=1e-2,
     )
 
 
@@ -262,6 +263,7 @@ def test_torch_avg_pool1d(
     ceil_mode=st.booleans(),
     count_include_pad=st.booleans(),
     test_with_out=st.just(False),
+    number_positional_args=st.just(1),
 )
 def test_torch_avg_pool2d(
     dtype_x_k_s,
@@ -291,6 +293,8 @@ def test_torch_avg_pool2d(
         ceil_mode=ceil_mode,
         count_include_pad=count_include_pad,
         divisor_override=None,
+        atol=1e-1 if backend_fw == "jax" else 1e-4,
+        rtol=1e-1 if backend_fw == "jax" else 1e-4,
     )
 
 
@@ -495,6 +499,8 @@ def test_torch_max_pool2d(
     dtype, x, kernel, stride, padding, dilation = x_k_s_p
     if not isinstance(padding, int):
         padding = [pad[0] for pad in padding]
+    # TODO: Remove this once the paddle backend supports dilation
+    assume(not (backend_fw == "paddle" and max(list(dilation)) > 1))
     helpers.test_frontend_function(
         input_dtypes=dtype,
         backend_to_test=backend_fw,

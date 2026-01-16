@@ -1,23 +1,32 @@
-name: tests
+name: docstrings
 on:
   push:
+    branches:
+      main
+  pull_request:
     branches:
       main
   workflow_dispatch:
 jobs:
   docstring-tests:
-    if: ${{(github.event_name == 'push') || contains(github.event.pull_request.labels.*.name, 'Exhaustive CI') || contains(github.event.pull_request.labels.*.name, 'Function Reformatting')}}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           path: ivy
           persist-credentials: false
+
       - uses: actions/setup-python@v3
         with:
-          python-version: "3.8"
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          cd ivy
+          python3 -m pip install -U -r requirements/requirements.txt
+          python3 -m pip install -U -r requirements/optional.txt
 
       - name: Run Docstring Tests
         run: |
           cd ivy
-          docker run --rm -i -v "$(pwd)":/ivy transpileai/ivy:latest python3 -m pytest ivy_tests/test_docstrings.py -p no:warnings
+          python3 -m pytest ivy_tests/test_docstrings.py -p no:warnings

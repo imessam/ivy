@@ -1,6 +1,8 @@
 # global
+import jax
 import jax.numpy as jnp
 from typing import Optional, Literal, Union, List
+from packaging.version import parse as _parse
 
 # local
 import ivy
@@ -31,7 +33,11 @@ def sort(
     out: Optional[JaxArray] = None,
 ) -> JaxArray:
     kind = "stable" if stable else "quicksort"
-    ret = jnp.asarray(jnp.sort(x, axis=axis, kind=kind))
+    if _parse(jax.__version__) > _parse("0.4.28"):
+        # kind argument has been removed in jax 0.4.28
+        ret = jnp.asarray(jnp.sort(x, axis=axis, stable=stable))
+    else:
+        ret = jnp.asarray(jnp.sort(x, axis=axis, kind=kind))
     if descending:
         ret = jnp.asarray(jnp.flip(ret, axis=axis))
     return ret
@@ -69,7 +75,7 @@ def searchsorted(
         ret = jnp.array(out_array).reshape(original_shape)
     else:
         ret = jnp.searchsorted(x, v, side=side)
-    return ret.astype(ret_dtype)
+    return jnp.astype(ret, ret_dtype)
 
 
 # msort

@@ -1,8 +1,5 @@
-name: tests
+name: pr-tests
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
@@ -13,8 +10,12 @@ jobs:
   relevant-tests:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Ivy 🛎
-        uses: actions/checkout@v3
+      - uses: actions/setup-python@v3
+        with:
+          python-version: "3.12"
+
+      - name: Checkout Ivy
+        uses: actions/checkout@v4
         with:
           path: ivy
           persist-credentials: false
@@ -31,15 +32,9 @@ jobs:
             git diff HEAD^ HEAD --output="commit-diff.txt"
           fi
 
-
-      - name: Install ivy and fetch binaries
+      - name: Install ivy
         run: |
-          cd ivy
-          sudo pip3 install -e .
-          mkdir .ivy
-          touch .ivy/key.pem
-          echo -n ${{ secrets.USER_API_KEY }} > .ivy/key.pem
-          cd ..
+          sudo pip3 install -e ivy/
 
       - name: Get Job URL
         uses: Tiryoh/gha-jobid-action@v0
@@ -48,14 +43,14 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           job_name: ${{ github.job }}
 
+      - name: Install Dependencies
+        run: |
+          cd ivy
+          python3 -m pip install -U -r requirements/requirements.txt
+          python3 -m pip install -U -r requirements/optional.txt
+
       - name: Run Tests
         id: tests
         run: |
-          pip3 install pymongo
           cd ivy
-          docker run --rm -v "$(pwd)":/ivy -v "$(pwd)"/.hypothesis:/.hypothesis transpileai/ivy:latest python3 scripts/run_tests_from_diff.py
-        continue-on-error: true
-
-      - name: Check on failures
-        if: steps.tests.outcome != 'success'
-        run: exit 1
+          python3 scripts/run_tests_from_diff.py

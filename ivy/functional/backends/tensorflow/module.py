@@ -3,11 +3,38 @@ from __future__ import annotations
 import re
 import os
 import tensorflow as tf
+import keras
 import functools
 from tensorflow.python.util import nest
-from typing import NamedTuple, Callable, Any, Tuple, List, Dict, Type, Union
+from typing import (
+    NamedTuple,
+    Callable,
+    Any,
+    Tuple,
+    List,
+    Set,
+    Dict,
+    Type,
+    Iterator,
+    Optional,
+    Union,
+    TYPE_CHECKING,
+)
+import itertools
+import warnings
+import typing
 import inspect
 from collections import OrderedDict
+from packaging.version import parse
+
+if TYPE_CHECKING:
+    pass
+
+
+if keras.__version__ >= "3.0.0":
+    KerasVariable = keras.src.backend.Variable
+else:
+    KerasVariable = tf.Variable
 
 
 def get_assignment_dict():
@@ -102,6 +129,11 @@ def _dict_unflatten(values: List[Any], context: Context) -> Dict[Any, Any]:
 
 
 _register_pytree_node(dict, _dict_flatten, _dict_unflatten)
+
+if parse(keras.__version__).major > 2:
+    _register_pytree_node(
+        keras.src.utils.tracking.TrackedDict, _dict_flatten, _dict_unflatten
+    )
 
 
 def _get_node_type(pytree: Any) -> Any:
@@ -215,6 +247,360 @@ def tree_unflatten(values: List[Any], spec: TreeSpec) -> PyTree:
     return unflatten_fn(child_pytrees, spec.context)
 
 
+def serialize_obj(obj):
+    if inspect.isclass(obj) or isinstance(obj, type):
+        return {"cls_module": obj.__module__, "cls_name": obj.__name__}
+    return obj
+
+
+def recursive_serialize(d):
+    if isinstance(d, dict):
+        return {k: recursive_serialize(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [recursive_serialize(v) for v in d]
+    elif isinstance(d, tuple):
+        return tuple(recursive_serialize(v) for v in d)
+    else:
+        return serialize_obj(d)
+
+
+def deserialize_obj(serialized):
+    if (
+        isinstance(serialized, dict)
+        and "cls_module" in serialized
+        and "cls_name" in serialized
+    ):
+        module = __import__(serialized["cls_module"], fromlist=[serialized["cls_name"]])
+        cls = getattr(module, serialized["cls_name"])
+        return cls
+    return serialized
+
+
+def recursive_deserialize(d):
+    if isinstance(d, dict) and "cls_module" not in d:
+        return {k: recursive_deserialize(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [recursive_deserialize(v) for v in d]
+    elif isinstance(d, tuple):
+        return tuple(recursive_serialize(v) for v in d)
+    else:
+        return deserialize_obj(d)
+
+class TorchModuleHelpers:
+
+    def add_module(self, name: str, module: Optional["Model"]) -> None:
+        if not isinstance(module, (Model, Layer, keras.Model,  keras.layers.Layer)) and module is not None:
+            raise TypeError(f"{type(module)} is not a Module subclass")
+        elif not isinstance(name, str):
+            raise TypeError(f"module name should be a string. Got {type(name)}")
+        elif hasattr(self, name) and name not in self._modules:
+            raise KeyError(f"attribute '{name}' already exists")
+        elif "." in name:
+            raise KeyError(f'module name can\'t contain ".", got: {name}')
+        elif name == "":
+            raise KeyError('module name can\'t be empty string ""')
+
+        self._modules[name] = module
+
+        super().__setattr__(name, module)
+
+    def apply(self, fn: Callable[["Model"], None]):
+        for module in self.children():
+            if hasattr(module, "apply"):
+                module.apply(fn)
+            else:
+                fn(module)
+        fn(self)
+        return self
+
+    def _apply(self, fn, recurse=True):
+        if recurse:
+            if hasattr(self, "children"):
+                for module in self.children():
+                    if hasattr(module, "_apply"):
+                        module._apply(fn)
+        for key, param in self.v.items():
+            if param is not None:
+                self.v[key] = fn(param)
+        for key, buf in self.buffers.items():
+            if buf is not None:
+                self.buffers[key] = fn(buf)
+        return self
+
+    def _named_members(
+        self, get_members_fn, prefix="", recurse=True, remove_duplicate: bool = True
+    ):
+        r"""Helper method for yielding various names + members of modules."""
+        memo = set()
+        modules = (
+            self.named_modules(prefix=prefix, remove_duplicate=remove_duplicate)
+            if recurse
+            else [(prefix, self)]
+        )
+        for module_prefix, module in modules:
+            members = get_members_fn(module)
+            for k, v in members:
+                if v is None or id(v) in memo:
+                    continue
+                if remove_duplicate:
+                    memo.add(id(v))
+                name = module_prefix + ("." if module_prefix else "") + k
+                yield name, v
+                
+    def register_module(self, name: str, module: Optional["Model"]) -> None:
+        r"""Alias for :func:`add_module`."""
+        self.add_module(name, module)
+
+    def get_submodule(self, target: str) -> "Model":
+        if target == "":
+            return self
+
+        atoms: List[str] = target.split(".")
+        mod: Model = self
+
+        for item in atoms:
+            if not hasattr(mod, item):
+                raise AttributeError(
+                    mod._get_name() + " has no attribute `" + item + "`"
+                )
+
+            mod = getattr(mod, item)
+
+            if not isinstance(mod, (Model, Layer, keras.Model,  keras.layers.Layer)):
+                raise TypeError("`" + item + "` is not a Module")
+
+        return mod
+
+    def get_parameter(self, target: str):
+        target = target.replace(".", "/")
+        return self.v[target]
+
+    def parameters(self, recurse: bool = True):
+        for _, param in self.named_parameters(recurse=recurse):
+            yield param
+
+    def named_parameters(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ):
+        if not getattr(self, "_built", False):
+            self.build(
+                *self._args, dynamic_backend=self._dynamic_backend, **self._kwargs
+            )
+        gen = self._named_members(
+            lambda module: module.v.items(),
+            prefix=prefix,
+            recurse=recurse,
+            remove_duplicate=remove_duplicate,
+        )
+        yield from gen
+
+    def named_buffers(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ):
+        if not getattr(self, "_built", False):
+            self.build(
+                *self._args, dynamic_backend=self._dynamic_backend, **self._kwargs
+            )
+        gen = self._named_members(
+            lambda module: module.buffers.items(),
+            prefix=prefix,
+            recurse=recurse,
+            remove_duplicate=remove_duplicate,
+        )
+        yield from gen
+
+    def children(self) -> Iterator["Model"]:
+        for _, module in self.named_children():
+            yield module
+
+    def named_children(self) -> Iterator[Tuple[str, "Model"]]:
+        if not getattr(self, "_built", False):
+            self.build(
+                *self._args, dynamic_backend=self._dynamic_backend, **self._kwargs
+            )
+        memo = set()
+        for name, module in self._module_dict.items():
+            if module is not None and id(module) not in memo:
+                memo.add(id(module))
+                yield name, module
+
+    def modules(self) -> Iterator["Model"]:
+        for _, module in self.named_modules():
+            yield module
+
+    def named_modules(
+        self,
+        memo: Optional[Set["Model"]] = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ):
+        if not getattr(self, "_built", False):
+            self.build(
+                *self._args, dynamic_backend=self._dynamic_backend, **self._kwargs
+            )
+        if memo is None:
+            memo = set()
+        if id(self) not in memo:
+            if remove_duplicate:
+                memo.add(id(self))
+            yield prefix, self
+            for name, module in self._module_dict.items():
+                if module is None:
+                    continue
+                submodule_prefix = prefix + ("." if prefix else "") + name
+                if not hasattr(module, "named_modules"):
+                    yield submodule_prefix, self
+                else:
+                    yield from module.named_modules(
+                        memo, submodule_prefix, remove_duplicate
+                    )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        def _retrive_layer(model, key):
+            if len(key.split(".")) == 1:
+                return model, key
+
+            module_path, weight_name = key.rsplit(".", 1)
+
+            # Retrieve the layer using the module path
+            layer = model
+            for attr in module_path.split("."):
+                layer = getattr(layer, attr)
+
+            return layer, weight_name
+
+        persistent_buffers = {k: v for k, v in self._buffers.items()}
+        local_name_params = itertools.chain(
+            self._parameters.items(), persistent_buffers.items()
+        )
+        local_state = {k: v for k, v in local_name_params if v is not None}
+
+        for name, param in local_state.items():
+            key = prefix + name
+            if key in state_dict:
+                input_param = state_dict[key]
+                if not isinstance(input_param, tf.Tensor):
+                    error_msgs.append(
+                        f'While copying the parameter named "{key}", '
+                        "expected ArrayLike object from checkpoint but "
+                        f"received {type(input_param)}"
+                    )
+                    continue
+
+                if not isinstance(input_param, KerasVariable):
+                    input_param = KerasVariable(input_param)
+
+                layer, weight_name = _retrive_layer(self, name)
+                try:
+                    setattr(layer, weight_name, input_param)
+                except Exception as ex:
+                    error_msgs.append(
+                        f'While copying the parameter named "{key}", '
+                        f"whose dimensions in the model are {param.shape} and "
+                        f"whose dimensions in the checkpoint are {input_param.shape}, "
+                        f"an exception occurred : {ex.args}."
+                    )
+            elif strict:
+                missing_keys.append(key)
+
+        if strict:
+            for key in state_dict.keys():
+                if key.startswith(prefix):
+                    input_name = key[len(prefix) :].split(".", 1)
+                    if len(input_name) > 1:
+                        if input_name[0] not in self._modules:
+                            unexpected_keys.append(key)
+                    elif input_name[0] not in local_state:
+                        unexpected_keys.append(key)
+
+    def load_state_dict(
+        self,
+        state_dict: typing.Mapping[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        r"""Copy parameters and buffers from :attr:`state_dict` into this module and its descendants.
+
+        If :attr:`strict` is ``True``, then
+        the keys of :attr:`state_dict` must exactly match the keys returned
+        by this module's :meth:`~Module.state_dict` function.
+
+        Args:
+            state_dict (dict): a dict containing parameters and
+                persistent buffers.
+            strict (bool, optional): whether to strictly enforce that the keys
+                in :attr:`state_dict` match the keys returned by this module's
+                :meth:`~Module.state_dict` function. Default: ``True``
+
+        Returns:
+            ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
+                * **missing_keys** is a list of str containing any keys that are expected
+                    by this module but missing from the provided ``state_dict``.
+                * **unexpected_keys** is a list of str containing the keys that are not
+                    expected by this module but present in the provided ``state_dict``.
+        """
+        if not isinstance(state_dict, typing.Mapping):
+            raise TypeError(
+                f"Expected state_dict to be dict-like, got {type(state_dict)}."
+            )
+
+        missing_keys: List[str] = []
+        unexpected_keys: List[str] = []
+        error_msgs: List[str] = []
+
+        state_dict = tf.nest.map_structure(
+            lambda x: tf.convert_to_tensor(x.numpy()),
+            state_dict,
+        )
+        state_dict = OrderedDict(state_dict)
+
+        def load(module, local_state_dict, prefix=""):
+            module._load_from_state_dict(
+                local_state_dict,
+                prefix,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+            # TODO: maybe we should implement this similar to PT
+            # and make this recursive.
+
+        load(self, state_dict)
+        del load
+
+        if len(error_msgs) > 0:
+            raise RuntimeError(
+                "Error(s) in loading state_dict for {}:\n\t{}".format(
+                    self.__class__.__name__, "\n\t".join(error_msgs)
+                )
+            )
+        if strict:
+            missing_keys = sorted(missing_keys)
+            unexpected_keys = sorted(unexpected_keys)
+            if len(missing_keys) > 0:
+                warnings.warn(
+                    "Missing key(s) in state_dict: {}\n".format(
+                        ", ".join(f"'{k}'" for k in missing_keys)
+                    )
+                )
+            if len(unexpected_keys) > 0:
+                warnings.warn(
+                    "Unexpected key(s) in state_dict: {}\n".format(
+                        ", ".join(f"'{k}'" for k in unexpected_keys)
+                    )
+                )
+
+    def requires_grad_(self, requires_grad: bool = True):
+        for p in self.parameters():
+            p.requires_grad_(requires_grad)
+        return self
+
+    def _get_name(self):
+        return self.__class__.__name__
+    
 class ModelHelpers:
     @staticmethod
     @tf.autograph.experimental.do_not_convert
@@ -380,7 +766,7 @@ class ModelHelpers:
         return s
 
 
-class Layer(tf.keras.layers.Layer, ModelHelpers):
+class Layer(tf.keras.layers.Layer, ModelHelpers, TorchModuleHelpers):
     _build_mode = None
     _with_partial_v = None
     _store_vars = True
@@ -419,6 +805,8 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
             trainable=training,
             dtype=dtype,
         )
+        if hasattr(self, 'forward'):
+            self._call_signature = inspect.signature(self.forward)
         self._build_mode = build_mode
         self._with_partial_v = with_partial_v
         self._store_vars = store_vars
@@ -658,7 +1046,19 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
             return ret
         elif hasattr(self.__call__, "wrapped"):
             return self.__call__(*args, **kwargs)
-        return super(Layer, self).__call__(*args, **kwargs)  # noqa: UP008
+
+        # Get the signature of the forward method
+        call_signature = inspect.signature(self.forward)
+
+        # Convert all positional arguments to keyword arguments based on the signature
+        new_kwargs = {}
+        for idx, (param_name, param) in enumerate(call_signature.parameters.items()):
+            if idx < len(args):
+                new_kwargs[param_name] = args[idx]
+
+        # Merge the existing kwargs
+        new_kwargs.update(kwargs)
+        return super(Layer, self).__call__(**new_kwargs)  # noqa: UP008
 
     @tf.autograph.experimental.do_not_convert
     def build(
@@ -673,8 +1073,11 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
         self._built = True
         return
 
+    def _lock_state(self):
+        pass
+
     @tf.autograph.experimental.do_not_convert
-    def register_buffer(self, name: str, value: Union[tf.Tensor, tf.Variable]):
+    def register_buffer(self, name: str, value: Union[tf.Tensor, tf.Variable], persistent: bool = False):
         self._buffers.update({name: value})
         return value
 
@@ -700,10 +1103,17 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
         return self.train(mode=False)
 
     @tf.autograph.experimental.do_not_convert
-    def call(self, inputs, training=None, mask=None):
-        raise NotImplementedError(
-            "When subclassing the `Module` class, you should implement a `call` method."
-        )
+    def call(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def get_build_config(self):
+        config = super().get_build_config()
+        config = recursive_serialize(config)
+        return config
+
+    def build_from_config(self, config):
+        config = recursive_deserialize(config)
+        return super().build_from_config(config)
 
     def get_config(self):
         base_config = super().get_config()
@@ -717,7 +1127,7 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
         var_positional_arg_encountered = False
         var_positional_arg_name = None
         offset = 0
-        for i, arg in enumerate(self._args[1:]):
+        for i, arg in enumerate(self._args):
             arg_name = arg_names[min(i, len(arg_names) - 1)]
             if var_positional_arg_encountered:
                 config.update(
@@ -748,10 +1158,13 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
         kwargs = self._kwargs.copy()
         kwargs.pop("devices", None)
         config.update(**kwargs)
-        return {**base_config, **config}
+        new_config = {**base_config, **config}
+        new_config = recursive_serialize(new_config)
+        return new_config
 
     @classmethod
     def from_config(cls, config):
+        config = recursive_deserialize(config)
         # Get the signature of the __init__ method
         init_signature = inspect.signature(cls.__init__)
         arg_names = list(init_signature.parameters.keys())
@@ -857,6 +1270,10 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
     def module_dict(self):
         return self._module_dict
 
+    @property
+    def layers(self):
+        return self._layers
+
     # Dunder Methods #
     # ---------------#
     @store_frame_info
@@ -947,7 +1364,7 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
 
             super().__setattr__(name, value)
             return
-        elif isinstance(value, tf.Variable) and not name.startswith("_"):
+        elif isinstance(value, (tf.Variable, KerasVariable)) and not name.startswith("_"):
             _dict = getattr(self, "__dict__", None)
             if _dict:
                 _dict[name] = value
@@ -970,7 +1387,7 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
             val = (
                 value
                 if not cast_dtype
-                else tf.Variable(initial_value=tf.cast(value.value(), dtype), name=name)
+                else KerasVariable(initial_value=tf.cast(value.value(), dtype), name=name)
             )
             self.register_parameter(name, val)
             super().__setattr__(name, val)
@@ -1041,7 +1458,7 @@ class Layer(tf.keras.layers.Layer, ModelHelpers):
         return main_str
 
 
-class Model(tf.keras.Model, ModelHelpers):
+class Model(tf.keras.Model, ModelHelpers, TorchModuleHelpers):
     _build_mode = None
     _with_partial_v = None
     _store_vars = True
@@ -1080,6 +1497,8 @@ class Model(tf.keras.Model, ModelHelpers):
             trainable=training,
             dtype=dtype,
         )
+        if hasattr(self, 'forward'):
+            self._call_signature = inspect.signature(self.forward)
         self._build_mode = build_mode
         self._with_partial_v = with_partial_v
         self._store_vars = store_vars
@@ -1319,7 +1738,19 @@ class Model(tf.keras.Model, ModelHelpers):
             return ret
         elif hasattr(self.__call__, "wrapped"):
             return self.__call__(*args, **kwargs)
-        return super(Model, self).__call__(*args, **kwargs)  # noqa: UP008
+
+        # Get the signature of the forward method
+        call_signature = inspect.signature(self.forward)
+
+        # Convert all positional arguments to keyword arguments based on the signature
+        new_kwargs = {}
+        for idx, (param_name, param) in enumerate(call_signature.parameters.items()):
+            if idx < len(args):
+                new_kwargs[param_name] = args[idx]
+
+        # Merge the existing kwargs
+        new_kwargs.update(kwargs)
+        return super(Model, self).__call__(**new_kwargs)  # noqa: UP008
 
     @tf.autograph.experimental.do_not_convert
     def build(
@@ -1334,8 +1765,11 @@ class Model(tf.keras.Model, ModelHelpers):
         self._built = True
         return
 
+    def _lock_state(self):
+        pass
+
     @tf.autograph.experimental.do_not_convert
-    def register_buffer(self, name: str, value: Union[tf.Tensor, tf.Variable]):
+    def register_buffer(self, name: str, value: Union[tf.Tensor, tf.Variable], persistent: bool = False):
         self._buffers.update({name: value})
         return value
 
@@ -1361,10 +1795,17 @@ class Model(tf.keras.Model, ModelHelpers):
         return self.train(mode=False)
 
     @tf.autograph.experimental.do_not_convert
-    def call(self, inputs, training=None, mask=None):
-        raise NotImplementedError(
-            "When subclassing the `Module` class, you should implement a `call` method."
-        )
+    def call(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def get_build_config(self):
+        config = super().get_build_config()
+        config = recursive_serialize(config)
+        return config
+
+    def build_from_config(self, config):
+        config = recursive_deserialize(config)
+        return super().build_from_config(config)
 
     def get_config(self):
         base_config = super().get_config()
@@ -1378,7 +1819,7 @@ class Model(tf.keras.Model, ModelHelpers):
         var_positional_arg_encountered = False
         var_positional_arg_name = None
         offset = 0
-        for i, arg in enumerate(self._args[1:]):
+        for i, arg in enumerate(self._args):
             arg_name = arg_names[min(i, len(arg_names) - 1)]
             if var_positional_arg_encountered:
                 config.update(
@@ -1409,10 +1850,13 @@ class Model(tf.keras.Model, ModelHelpers):
         kwargs = self._kwargs.copy()
         kwargs.pop("devices", None)
         config.update(**kwargs)
-        return {**base_config, **config}
+        new_config = {**base_config, **config}
+        new_config = recursive_serialize(new_config)
+        return new_config
 
     @classmethod
     def from_config(cls, config):
+        config = recursive_deserialize(config)
         # Get the signature of the __init__ method
         init_signature = inspect.signature(cls.__init__)
         arg_names = list(init_signature.parameters.keys())
@@ -1608,7 +2052,7 @@ class Model(tf.keras.Model, ModelHelpers):
 
             super().__setattr__(name, value)
             return
-        elif isinstance(value, tf.Variable) and not name.startswith("_"):
+        elif isinstance(value, (tf.Variable, KerasVariable)) and not name.startswith("_"):
             _dict = getattr(self, "__dict__", None)
             if _dict:
                 _dict[name] = value
@@ -1632,7 +2076,7 @@ class Model(tf.keras.Model, ModelHelpers):
             val = (
                 value
                 if not cast_dtype
-                else tf.Variable(initial_value=tf.cast(value.value(), dtype), name=name)
+                else KerasVariable(initial_value=tf.cast(value.value(), dtype), name=name)
             )
             self.register_parameter(name, val)
             super().__setattr__(name, val)

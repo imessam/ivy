@@ -13,7 +13,6 @@ from collections.abc import Sequence
 
 
 import ivy.utils.backend.handler
-from ivy.utils import check_for_binaries
 from ivy._version import __version__ as __version__
 
 _not_imported_backends = list(ivy.utils.backend.handler._backend_dict.keys())
@@ -493,10 +492,7 @@ class Shape(Sequence):
             raise ivy.utils.exceptions.IvyException(
                 "Cannot calculate the number of elements in a partially known Shape"
             )
-        res = 1
-        for dim in self._shape:
-            res *= dim
-        return res
+        return ivy.prod(self.as_list(), dtype=ivy.int64).to_scalar()
 
     def __concat__(self, other):
         return self.concatenate(other)
@@ -602,7 +598,6 @@ warning_level_stack = []
 nan_policy_stack = []
 dynamic_backend_stack = []
 warn_to_regex = {"all": "!.*", "ivy_only": "^(?!.*ivy).*$", "none": ".*"}
-cython_wrappers_stack = []
 
 # local
 import threading
@@ -752,7 +747,6 @@ invalid_complex_dtypes = ()
 
 locks = {"backend_setter": threading.Lock()}
 
-from .wrappers import *
 from .func_wrapper import *
 from .data_classes.array import Array, add_ivy_array_instance_methods
 from .data_classes.array.conversions import *
@@ -787,9 +781,8 @@ from ivy.utils.backend import (
     choose_random_backend,
     unset_backend,
 )
-from . import wrappers
 from . import func_wrapper
-from .utils import assertions, exceptions, verbosity
+from .utils import assertions, exceptions
 from .utils.backend import handler
 from . import functional
 from .functional import *
@@ -802,24 +795,19 @@ add_array_specs()
 _imported_frameworks_before_compiler = list(sys.modules.keys())
 
 try:
-    from .engines import XLA as xla
-    from .engines import ivy2xla
-except:  # noqa: E722
-    pass
-try:
-    from .compiler.compiler import transpile, trace_graph, unify
+    from .tracer import trace_graph
+    from .transpiler import (
+        source_to_source,
+        transpile,
+    )
 except:  # noqa: E722
     pass  # Added for the finally statement
-try:
-    from .compiler.replace_with import replace_with, transform_function
-except:  # noqa: E722
-    pass
-finally:
-    # Skip framework imports done by Ivy compiler for now
-    for backend_framework in _not_imported_backends.copy():
-        if backend_framework in sys.modules:
-            if backend_framework not in _imported_frameworks_before_compiler:
-                _not_imported_backends.remove(backend_framework)
+
+# Skip framework imports done by Ivy compiler for now
+for backend_framework in _not_imported_backends.copy():
+    if backend_framework in sys.modules:
+        if backend_framework not in _imported_frameworks_before_compiler:
+            _not_imported_backends.remove(backend_framework)
 
 
 # add instance methods to Ivy Array and Container
@@ -974,7 +962,6 @@ globals_vars = GlobalsDict(
         "default_uint_dtype_stack": data_type.default_uint_dtype_stack,
         "nan_policy_stack": nan_policy_stack,
         "dynamic_backend_stack": dynamic_backend_stack,
-        "cython_wrappers_stack": cython_wrappers_stack,
     }
 )
 
@@ -1001,7 +988,7 @@ native_inplace_support = None
 
 supports_gradients = None
 
-
+Variable = Array
 # Array Significant Figures #
 
 
@@ -1014,12 +1001,33 @@ def _assert_array_significant_figures_formatting(sig_figs):
 def vec_sig_fig(x, sig_fig=3):
     if isinstance(x, np.bool_):
         return x
-    if isinstance(x, complex):
-        return complex(x)
+    if isinstance(x, builtins.complex):
+        return builtins.complex(x)
     if np.issubdtype(x.dtype, np.floating):
+        # Handle float16 and other low-precision dtypes by converting to float32
+        # to avoid overflow in calculations
+        original_dtype = x.dtype
+        if x.dtype == np.float16:
+            x = x.astype(np.float32)
+
         x_positive = np.where(np.isfinite(x) & (x != 0), np.abs(x), 10 ** (sig_fig - 1))
-        mags = 10 ** (sig_fig - 1 - np.floor(np.log10(x_positive)))
-        return np.round(x * mags) / mags
+
+        # Protect against overflow in magnitude calculations
+        log_vals = np.log10(x_positive)
+        mags_exp = sig_fig - 1 - np.floor(log_vals)
+
+        # Clamp the exponent to prevent overflow
+        max_exp = np.log10(np.finfo(x.dtype).max) - 1
+        mags_exp = np.clip(mags_exp, -max_exp, max_exp)
+
+        mags = 10 ** mags_exp
+        result = np.round(x * mags) / mags
+
+        # Convert back to original dtype if it was low precision
+        if original_dtype == np.float16:
+            result = result.astype(original_dtype)
+
+        return result
     return x
 
 
@@ -1183,12 +1191,14 @@ def unset_dynamic_backend():
 
 # Cython wrappers
 
-ivy.cython_wrappers_mode = cython_wrappers_stack[-1] if cython_wrappers_stack else False
+ivy.cython_wrappers_mode = False
 
 
 @handle_exceptions
-def set_cython_wrappers_mode(flag: bool = True) -> None:
-    """Set the mode of whether to use cython wrappers for functions.
+def set_cython_wrappers_mode(flag=True) -> None:
+    """
+    DEPRECATED
+    Set the mode of whether to use cython wrappers for functions.
 
     Parameter
     ---------
@@ -1205,11 +1215,7 @@ def set_cython_wrappers_mode(flag: bool = True) -> None:
     >>> ivy.cython_wrappers_mode
     True
     """
-    global cython_wrappers_stack
-    if flag not in [True, False]:
-        raise ValueError("cython_wrappers_mode must be a boolean value (True or False)")
-    cython_wrappers_stack.append(flag)
-    ivy.__setattr__("cython_wrappers_mode", flag, True)
+    warnings.warn("Ivy Cython wrappers are no longer supported", DeprecationWarning)
 
 
 # Context Managers
@@ -1568,8 +1574,3 @@ if (
     ].__class__ = IvyWithGlobalProps
 else:
     sys.modules[__name__].__class__ = IvyWithGlobalProps
-
-    # check if all expected binaries are present
-    # in this else block to avoid raising the same warning again
-    # on using with_backend
-    check_for_binaries()

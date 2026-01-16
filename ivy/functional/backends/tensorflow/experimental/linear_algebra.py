@@ -81,7 +81,50 @@ def kron(
     *,
     out: Optional[Union[tf.Tensor, tf.Variable]] = None,
 ) -> Union[tf.Tensor, tf.Variable]:
-    return tf.experimental.numpy.kron(a, b)
+    a_ndims = a.shape.ndims
+    b_ndims = b.shape.ndims
+
+    if a_ndims <= 2 and b_ndims <= 2:
+        return tf.experimental.numpy.kron(a, b)
+
+    a_shape = tf.shape(a)
+    b_shape = tf.shape(b)
+
+    if a_ndims is None or b_ndims is None:
+        raise ValueError("Cannot determine number of dimensions for input arrays.")
+
+    if a_ndims == 0 or b_ndims == 0:
+        return a * b
+
+    if a_ndims < b_ndims:
+        a = tf.reshape(
+            a, tf.concat([tf.ones(b_ndims - a_ndims, dtype=tf.int32), a_shape], 0)
+        )
+        a_shape = tf.shape(a)
+        a_ndims = b_ndims
+    elif b_ndims < a_ndims:
+        b = tf.reshape(
+            b, tf.concat([tf.ones(a_ndims - b_ndims, dtype=tf.int32), b_shape], 0)
+        )
+        b_shape = tf.shape(b)
+
+    ndims = a_ndims
+    if ndims == 0:
+        return a * b
+
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+    a_axes = alphabet[:ndims]
+    b_axes = alphabet[ndims : 2 * ndims]
+    einsum_str = f"{a_axes},{b_axes}->" + "".join(
+        [sub[item] for sub in zip(a_axes, b_axes) for item in range(2)]
+    )
+    promoted_dtype = tf.experimental.numpy.result_type(a.dtype, b.dtype)
+    a = tf.cast(a, promoted_dtype)
+    b = tf.cast(b, promoted_dtype)
+    res = tf.einsum(einsum_str, a, b)
+
+    final_shape = [a_shape[i] * b_shape[i] for i in range(ndims)]
+    return tf.reshape(res, final_shape)
 
 
 def matrix_exp(
@@ -251,7 +294,29 @@ def lu_solve(
     *,
     out: Optional[Union[tf.Tensor, tf.Variable]] = None,
 ) -> Union[tf.Tensor, tf.Variable]:
-    return tf.linalg.lu_solve(lu, p, b)
+    p = p - 1
+
+    # convert lapack pivots to permutation vector
+    n = tf.shape(lu)[-1]
+    perm_vector = tf.range(n, dtype=p.dtype)
+
+    def body(i, perm):
+        p_i = p[i]
+        val_at_i = perm[i]
+        val_at_p_i = perm[p_i]
+        indices = tf.expand_dims(tf.stack([i, p_i]), axis=-1)
+        updates = tf.stack([val_at_p_i, val_at_i])
+        perm = tf.tensor_scatter_nd_update(perm, indices, updates)
+        return i + 1, perm
+
+    num_pivots = tf.shape(p)[-1]
+    _, permutation_vector = tf.while_loop(
+        lambda i, perm: i < num_pivots,
+        body,
+        [tf.constant(0, dtype=p.dtype), perm_vector],
+        shape_invariants=[tf.TensorShape([]), perm_vector.get_shape()],
+    )
+    return tf.linalg.lu_solve(lu, permutation_vector, b)
 
 
 @with_supported_dtypes(

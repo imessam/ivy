@@ -84,6 +84,19 @@ def broadcast_to(tensor, shape):
 
 
 @to_ivy_arrays_and_back
+def bucketize(input, boundaries, *, out_int32=False, right=False, out=None):
+    if right:
+        idx = torch_frontend.searchsorted(boundaries, input, right=True)
+    else:
+        idx = torch_frontend.searchsorted(boundaries, input, right=False)
+
+    if out_int32:
+        return idx.int()
+    else:
+        return idx.long()
+
+
+@to_ivy_arrays_and_back
 def cartesian_prod(*tensors):
     if len(tensors) == 1:
         return tensors
@@ -141,7 +154,7 @@ def clone(input, *, memory_format=None):
     return ivy.copy_array(input)
 
 
-@with_unsupported_dtypes({"2.2 and below": ("float16", "bool")}, "torch")
+@with_unsupported_dtypes({"2.2 and below": ("float16", "bool", "complex")}, "torch")
 @to_ivy_arrays_and_back
 def corrcoef(input):
     if len(ivy.shape(input)) > 2:
@@ -149,7 +162,11 @@ def corrcoef(input):
             "corrcoef(): expected input to have two or fewer dimensions but got an"
             f" input with {ivy.shape(input)} dimensions"
         )
-    return ivy.corrcoef(input, y=None, rowvar=True)
+    if ivy.is_int_dtype(input.dtype):
+        input = ivy.astype(input, ivy.float32)
+    orig_dtype = input.dtype
+    ret = ivy.corrcoef(input, y=None, rowvar=True)
+    return ivy.astype(ret, orig_dtype)
 
 
 @to_ivy_arrays_and_back
@@ -190,8 +207,11 @@ def cummax(input, dim, *, out=None):
 
 @to_ivy_arrays_and_back
 def cumprod(input, dim, *, dtype=None, out=None):
-    if not dtype and "int" in input.dtype:
-        dtype = ivy.int64
+    if not dtype:
+        if "int" in str(input.dtype):
+            dtype = ivy.int64
+        else:
+            dtype = input.dtype
     return ivy.cumprod(input, axis=dim, dtype=dtype, out=out)
 
 
@@ -201,7 +221,7 @@ def cumprod(input, dim, *, dtype=None, out=None):
     "torch",
 )
 def cumsum(input, dim, *, dtype=None, out=None):
-    if not dtype and "int" in input.dtype:
+    if not dtype and "int" in str(input.dtype):
         dtype = ivy.int64
     return ivy.cumsum(input, axis=dim, dtype=dtype, out=out)
 
@@ -308,25 +328,11 @@ def flip(input, dims):
 
 @to_ivy_arrays_and_back
 def fliplr(input):
-    ivy.utils.assertions.check_greater(
-        len(input.shape),
-        2,
-        allow_equal=True,
-        message="requires tensor to be at least 2D",
-        as_array=False,
-    )
     return ivy.fliplr(input, copy=True)
 
 
 @to_ivy_arrays_and_back
 def flipud(input):
-    ivy.utils.assertions.check_greater(
-        len(input.shape),
-        1,
-        allow_equal=True,
-        message="requires tensor to be at least 1D",
-        as_array=False,
-    )
     return ivy.flipud(input, copy=True)
 
 
@@ -335,7 +341,48 @@ def gcd(input, other, *, out=None):
     return ivy.gcd(input, other, out=out)
 
 
+@with_supported_dtypes(
+    {"2.4 and below": ("float32", "float64")},
+    "torch",
+)
 @to_ivy_arrays_and_back
+def histc(input, bins=100, min=0, max=0, *, out=None):
+    if min == 0.0 and max == 0.0:
+        min = ivy.min(input)
+        max = ivy.max(input)
+
+    if min == max:
+        count = ivy.sum(ivy.astype(input == min, input.dtype))
+        ret = ivy.zeros((bins,), dtype=input.dtype)
+        if bins > 0:
+            ret[0] = count
+        return ret
+
+    # filter out values outside of range
+    input_filtered = input[(input >= min) & (input <= max)]
+
+    if input_filtered.size == 0:
+        return ivy.zeros(bins, dtype=input.dtype)
+
+    # handle max value including in last bin
+    epsilon = (max - min) / 1e6
+    input_adjusted = ivy.where(
+        input_filtered == max, input_filtered - epsilon, input_filtered
+    )
+
+    # calculate bin indices
+    bin_indices = ivy.floor(((input_adjusted - min) / (max - min)) * bins)
+
+    # clip bin_indices to be within [0, bins-1]
+    bin_indices = ivy.clip(bin_indices, 0, bins - 1)
+
+    return ivy.bincount(bin_indices.astype("int64"), minlength=bins).astype(
+        input.dtype
+    )
+
+
+@to_ivy_arrays_and_back
+@with_supported_dtypes({"2.2 and below": ("float16", "float32", "float64")}, "torch")
 def kron(input, other, *, out=None):
     return ivy.kron(input, other, out=out)
 
@@ -391,7 +438,7 @@ def ravel(input):
     return ivy.reshape(input, (-1,))
 
 
-@with_unsupported_dtypes({"2.2 and below": ("float16",)}, "torch")
+@with_unsupported_dtypes({"2.2 and below": ("bfloat16", "float16")}, "torch")
 @to_ivy_arrays_and_back
 def renorm(input, p, dim, maxnorm, *, out=None):
     # Torch hardcodes this magic number
@@ -452,75 +499,6 @@ def roll(input, shifts, dims=None):
 @to_ivy_arrays_and_back
 def rot90(input, k, dims):
     total_dims = ivy.get_num_dims(input)
-    total_rot_dims = len(dims)
-
-    ivy.utils.assertions.check_greater(
-        total_dims,
-        2,
-        allow_equal=True,
-        message="expected total dims >= 2, but got total dims = " + str(total_dims),
-        as_array=False,
-    )
-
-    ivy.utils.assertions.check_equal(
-        total_rot_dims,
-        2,
-        message="expected total rotation dims == 2, but got dims = "
-        + str(total_rot_dims),
-        as_array=False,
-    )
-
-    ivy.utils.assertions.check_equal(
-        dims[0],
-        dims[1],
-        inverse=True,
-        message="expected rotation dims to be different, but got dim0 = "
-        + str(dims[0])
-        + " and dim1 = "
-        + str(dims[1]),
-        as_array=False,
-    )
-
-    ivy.utils.assertions.check_equal(
-        ivy.abs(dims[0] - dims[1]),
-        total_dims,
-        inverse=True,
-        message="expected rotation dims to be different, but got dim0 = "
-        + str(dims[0])
-        + " and dim1 = "
-        + str(dims[1]),
-    )
-
-    # range of dims
-    ivy.utils.assertions.check_less(
-        dims[0],
-        total_dims,
-        message="Rotation dim0 out of range, dim0 = " + str(dims[0]),
-        as_array=False,
-    )
-
-    ivy.utils.assertions.check_greater(
-        dims[0],
-        -total_dims,
-        allow_equal=True,
-        message="Rotation dim0 out of range, dim0 = " + str(dims[0]),
-        as_array=False,
-    )
-
-    ivy.utils.assertions.check_less(
-        dims[1],
-        total_dims,
-        message="Rotation dim1 out of range, dim1 = " + str(dims[1]),
-        as_array=False,
-    )
-
-    ivy.utils.assertions.check_greater(
-        dims[1],
-        -total_dims,
-        allow_equal=True,
-        message="Rotation dim1 out of range, dim1 = " + str(dims[1]),
-        as_array=False,
-    )
 
     k = (4 + (k % 4)) % 4
     new_axes = list(range(total_dims))
@@ -573,9 +551,9 @@ def tensordot(a, b, dims=2, out=None):
 @to_ivy_arrays_and_back
 @with_unsupported_dtypes({"2.2 and below": ("float16", "bfloat16")}, "torch")
 def trace(input):
-    if "int" in input.dtype:
+    if "int" in str(input.dtype):
         input = input.astype("int64")
-    target_type = "int64" if "int" in input.dtype else input.dtype
+    target_type = "int64" if "int" in str(input.dtype) else input.dtype
     return ivy.astype(ivy.trace(input), target_type)
 
 

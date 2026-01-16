@@ -62,7 +62,7 @@ else:
     NativeArray = jaxlib.xla_extension.DeviceArray
 
 # noinspection PyUnresolvedReferences,PyProtectedMember
-NativeDevice = jaxlib.xla_extension.Device
+NativeDevice = jax.Device if version.parse(jax.__version__) >= version.parse("0.4.11") else jaxlib.xla_extension.Device
 NativeDtype = jnp.dtype
 NativeShape = tuple
 
@@ -238,7 +238,7 @@ from .experimental import *
 from . import control_flow_ops
 from .control_flow_ops import *
 from . import module
-from .module import *
+from .module import Module as Model
 
 
 # sub-backends
@@ -249,7 +249,7 @@ from .sub_backends import *
 if importlib.util.find_spec("flax"):
     import flax
 
-    NativeModule = flax.linen.Module
+    NativeModule = Model
 elif importlib.util.find_spec("haiku"):
     import haiku as hk
 

@@ -7,7 +7,6 @@ import copy
 import os
 import ivy
 
-DATA_FORMAT = "PT"
 CONV_FUNCS = [
     "Conv1d",
     "Conv2d",
@@ -24,6 +23,10 @@ KERAS_CONV_FUNCS = [
     "KerasConv1DTranspose",
     "KerasConv2DTranspose",
     "KerasConv3DTranspose",
+]
+FLAX_CONV_FUNCS = [
+    "FlaxConv",
+    "FlaxConvTranspose",
 ]
 POOL_FUNCS = [
     "MaxPool1d",
@@ -50,6 +53,7 @@ KERAS_POOL_FUNCS = [
     "KerasMaxPool2D",
     "KerasMaxPool3D",
 ]
+FLAX_POOL_FUNCS = []
 PADDING_FUNCS = [
     "ReflectionPad1d",
     "ReflectionPad2d",
@@ -66,6 +70,7 @@ KERAS_PADDING_FUNCS = [
     "KerasZeroPadding2D",
     "KerasZeroPadding3D",
 ]
+FLAX_PADDING_FUNCS = []
 ACTIVATION_FUNCS = [
     "ELU",
     "Hardshrink",
@@ -93,6 +98,7 @@ ACTIVATION_FUNCS = [
     "LogSoftmax",
     "AdaptiveLogSoftmaxWithLoss",
 ]
+FLAX_ACTIVATION_FUNCS = []
 KERAS_ACTIVATION_FUNCS = [
     "KerasReLU",
     "KerasPReLU",
@@ -124,6 +130,11 @@ KERAS_NORM_FUNCS = [
     "KerasUnitNorm2D",
     "KerasUnitNorm3D",
 ]
+FLAX_NORM_FUNCS = [
+    "FlaxBatchNorm",
+    "FlaxLayerNorm",
+    "FlaxGroupNorm",
+]
 DROPOUT_FUNCS = [
     "Dropout",
     "Dropout2d",
@@ -134,20 +145,26 @@ DROPOUT_FUNCS = [
 KERAS_DROPOUT_FUNCS = [
     "KerasDropout",
 ]
-
+FLAX_DROPOUT_FUNCS = []
 CONV_BLOCK_FNS = [
     *CONV_FUNCS,
     *KERAS_CONV_FUNCS,
+    *FLAX_CONV_FUNCS,
     *POOL_FUNCS,
     *KERAS_POOL_FUNCS,
+    *FLAX_POOL_FUNCS,
     *PADDING_FUNCS,
     *KERAS_PADDING_FUNCS,
+    *FLAX_PADDING_FUNCS,
     *ACTIVATION_FUNCS,
     *KERAS_ACTIVATION_FUNCS,
+    *FLAX_ACTIVATION_FUNCS,
     *NORM_FUNCS,
     *KERAS_NORM_FUNCS,
+    *FLAX_NORM_FUNCS,
     *DROPOUT_FUNCS,
     *KERAS_DROPOUT_FUNCS,
+    *FLAX_DROPOUT_FUNCS,
 ]
 
 
@@ -159,12 +176,25 @@ def handle_methods(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        if ivy.is_array(args[0]):
+        array_like = args[0]
+        if hasattr(array_like, "__class__") and array_like.__class__.__name__ in [
+            "list",
+            "tuple",
+        ]:
+            array_like = array_like[0]
+
+        if ivy.is_array(array_like):
             return fn(*args, **kwargs)
         else:
-            fn_name = extract_function_name(fn.__name__)
-            new_fn = getattr(args[0], fn_name)
-            return new_fn(*args[1:], **kwargs)
+            pattern = r"_bknd_|_bknd|_frnt_|_frnt"
+            fn_name = extract_function_name(re.sub(pattern, "", fn.__name__))
+            try:
+                new_fn = getattr(array_like, fn_name)
+                if not callable(new_fn):
+                    return new_fn
+                return new_fn(*args[1:], **kwargs)
+            except Exception:
+                return fn(*args, **kwargs)
 
     return wrapper
 
@@ -174,8 +204,6 @@ def handle_get_item(fn):
     def wrapper(inp, query, **kwargs):
         try:
             res = inp.__getitem__(query)
-        except IndexError:
-            raise
         except Exception:
             res = fn(inp, query, **kwargs)
         return res
@@ -257,7 +285,7 @@ def get_next_func(obj):
         return None
 
     # Check if the filename contains "Sequential"
-    if "Sequential" in frame_info.filename:
+    if "torch/nn/modules/container" in frame_info.filename:
         try:
             # find the next call in the sequence
             self_seq = calling_frame.f_locals["self"]
@@ -323,7 +351,10 @@ def apply_transpose(input, transpose, pt_to_tf=True):
         # -> TF: (kernel[0], kernel[1], kernel[2], num_in_channel, num_out_channel)
         axes = (0, 2, 3, 4, 1) if pt_to_tf else (0, 4, 1, 2, 3)
 
-    input = ivy.permute_dims(input, axes=axes).data
+    if ivy.is_array(input):
+        input = ivy.permute_dims(input, axes=axes).data
+    else:
+        input = tuple(input[i] for i in axes)
     return input
 
 
@@ -333,7 +364,7 @@ def handle_transpose_in_input_and_output(fn):
 
     @functools.wraps(fn)
     def transpose_wrapper(self, *args, **kwargs):
-        global DATA_FORMAT
+        DATA_FORMAT = os.environ.get("DATA_FORMAT", "channels_first")
         # isolates the actual `**kwargs` for the decorated function
         kwargs_call = {
             key: val
@@ -355,6 +386,9 @@ def handle_transpose_in_input_and_output(fn):
                 + KERAS_CONV_FUNCS
                 + KERAS_NORM_FUNCS
                 + KERAS_POOL_FUNCS
+                + FLAX_CONV_FUNCS
+                + FLAX_NORM_FUNCS
+                + FLAX_POOL_FUNCS
             )
         )
         next_call_in_seq = get_next_func(self)
@@ -367,8 +401,9 @@ def handle_transpose_in_input_and_output(fn):
             substr in name_of_next_call for substr in CONV_BLOCK_FNS
         )
 
-        if DATA_FORMAT == "PT" and conv_block_start(self.__class__):
-            input = fn_args_and_kwargs["input"]
+        arg_name = "input" if "input" in fn_args_and_kwargs else "inputs"
+        if DATA_FORMAT == "channels_first" and conv_block_start(self.__class__):
+            input = fn_args_and_kwargs[arg_name]
             if len(input.shape) > 4:
                 transpose = TransposeType.CONV3D
             elif len(input.shape) > 3:
@@ -377,16 +412,18 @@ def handle_transpose_in_input_and_output(fn):
                 transpose = TransposeType.CONV1D
             else:
                 transpose = TransposeType.NO_TRANSPOSE
-            fn_args_and_kwargs["input"] = apply_transpose(
+            fn_args_and_kwargs[arg_name] = apply_transpose(
                 input, transpose=transpose, pt_to_tf=True
             )
 
-            DATA_FORMAT = "TF"
-            os.environ["DATA_FORMAT"] = "channels_last"
+            DATA_FORMAT = "channels_last"
+            os.environ["DATA_FORMAT"] = DATA_FORMAT
 
         res = fn(self, **fn_args_and_kwargs)
 
-        if (DATA_FORMAT == "TF" and conv_block_continued) or DATA_FORMAT == "PT":
+        if (
+            DATA_FORMAT == "channels_last" and conv_block_continued
+        ) or DATA_FORMAT == "channels_first":
             return res
 
         if len(res.shape) > 4:
@@ -399,10 +436,57 @@ def handle_transpose_in_input_and_output(fn):
             transpose = TransposeType.NO_TRANSPOSE
         res = apply_transpose(res, transpose=transpose, pt_to_tf=False)
 
-        DATA_FORMAT = "PT"
-        os.environ["DATA_FORMAT"] = "channels_first"
+        DATA_FORMAT = "channels_first"
+        os.environ["DATA_FORMAT"] = DATA_FORMAT
 
         return res
 
     handle_transpose_in_input_and_output.__signature__ = original_signature
     return transpose_wrapper
+
+
+def handle_transpose_in_input_and_output_for_functions(fn):
+    @functools.wraps(fn)
+    def transpose_wrapper(*args, **kwargs):
+        DATA_FORMAT = os.environ.get("DATA_FORMAT", "channels_first")
+        if DATA_FORMAT == "channels_first":
+            value_map = {"channel_last": "channel_first", "NHWC": "NCHW", "NSC": "NCS"}
+            if "data_format" in kwargs and kwargs["data_format"] in value_map:
+                kwargs["data_format"] = value_map[kwargs["data_format"]]
+            if "filter_format" in kwargs and kwargs["filter_format"] in value_map:
+                kwargs["filter_format"] = value_map[kwargs["filter_format"]]
+            os.environ["DATA_FORMAT"] = "channels_last"
+
+        res = fn(*args, **kwargs)
+        os.environ["DATA_FORMAT"] = DATA_FORMAT
+        return res
+
+    return transpose_wrapper
+
+
+def handle_transpose_in_pad(fn):
+    @functools.wraps(fn)
+    def transpose_wrapper(input, pad_width, *args, **kwargs):
+        DATA_FORMAT = os.environ.get("DATA_FORMAT", "channels_first")
+        if DATA_FORMAT == "channels_last":
+            if len(input.shape) > 4:
+                transpose = TransposeType.CONV3D
+            elif len(input.shape) > 3:
+                transpose = TransposeType.CONV2D
+            elif len(input.shape) > 2:
+                transpose = TransposeType.CONV1D
+            else:
+                transpose = TransposeType.NO_TRANSPOSE
+            pad_width = apply_transpose(pad_width, transpose=transpose, pt_to_tf=True)
+
+        return fn(input, pad_width, *args, **kwargs)
+
+    return transpose_wrapper
+
+
+# TODO: temp fix for `ivy.inplace_update`. Dont quite understand the way this function
+# has been implemented in the backends as it seems to also have ivy.Array specific logic
+# In the case where both x, and val are arrays, it simply returns x (why??)
+# perhaps we can rewrite it in a cleaner format and then remove this fix
+def dummy_inplace_update(x, val, /, *, ensure_in_backend=False, keep_input_dtype=False):
+    return val

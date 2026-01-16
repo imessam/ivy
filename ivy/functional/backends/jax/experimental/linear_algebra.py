@@ -2,6 +2,7 @@ import math
 from typing import Optional, Tuple, Sequence, Union
 import jax.numpy as jnp
 import jax.scipy.linalg as jla
+import jax
 from collections import namedtuple
 from ivy.func_wrapper import with_supported_dtypes
 from ivy.functional.backends.jax import JaxArray
@@ -81,7 +82,7 @@ def diagflat(
         mode="constant",
     )
 
-    ret = output_array.astype(x.dtype)
+    ret = jnp.astype(output_array, x.dtype)
     if ivy.exists(out):
         ivy.inplace_update(out, ret)
 
@@ -180,10 +181,16 @@ def lu_factor(
     pivot: Optional[bool] = True,
     out: Optional[JaxArray] = None,
 ) -> Tuple[JaxArray, JaxArray]:
-    ret = jla.lu(x)
     ret_tuple = namedtuple("lu_factor", ["LU", "p"])
-    ret_1 = ret[1]
-    return ret_tuple((ret_1 - jnp.eye(*ret_1.shape)) + ret[2], ret[0])
+    lu, piv = jla.lu_factor(x)
+    m = lu.shape[-2]
+
+    def body_fun(i, p):
+        p = p.at[i].set(p[piv[i]]).at[piv[i]].set(p[i])
+        return p
+
+    p = jax.lax.fori_loop(0, m, body_fun, jnp.arange(m))
+    return ret_tuple(lu, p)
 
 
 def lu_solve(
@@ -194,6 +201,7 @@ def lu_solve(
     *,
     out: Optional[JaxArray] = None,
 ) -> JaxArray:
+    p = p - 1
     return jla.lu_solve((lu, p), b)
 
 
